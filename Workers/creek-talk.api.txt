@@ -1,0 +1,125 @@
+export default {
+  async fetch(request, env) {
+
+    const url = new URL(request.url);
+
+    const cors = {
+      "Access-Control-Allow-Origin":"*",
+      "Access-Control-Allow-Methods":"GET,POST,OPTIONS",
+      "Access-Control-Allow-Headers":"Content-Type"
+    };
+
+    if(request.method==="OPTIONS"){
+      return new Response(null,{headers:cors});
+    }
+
+    if(url.pathname==="/"){
+      return json({success:true,app:"Creek Talk API"});
+    }
+
+    if(url.pathname==="/feed"){
+
+      const {results}=await env.CREEK_EXPLORER_DB.prepare(`
+        SELECT *
+        FROM creek_talk_posts
+        ORDER BY datetime(created_at) DESC
+        LIMIT 50
+      `).all();
+
+      return json(results);
+    }
+
+    if(url.pathname==="/create" && request.method==="POST"){
+
+      const body=await request.json();
+
+      await env.CREEK_EXPLORER_DB.prepare(`
+        INSERT INTO creek_talk_posts
+        (
+          customer_id,
+          customer_name,
+          creek_id,
+          creek_name,
+          species_id,
+          species_name,
+          post_type,
+          body,
+          photo_url,
+          visibility
+        )
+        VALUES (?,?,?,?,?,?,?,?,?,?)
+      `)
+      .bind(
+        body.customer_id,
+        body.customer_name,
+        body.creek_id,
+        body.creek_name,
+        body.species_id,
+        body.species_name,
+        body.post_type,
+        body.body,
+        body.photo_url,
+        body.visibility
+      )
+      .run();
+
+      return json({
+        success:true
+      });
+    }
+
+    if(url.pathname==="/delete" && request.method==="POST"){
+
+      const body=await request.json();
+
+      const post=await env.CREEK_EXPLORER_DB.prepare(`
+        SELECT customer_id
+        FROM creek_talk_posts
+        WHERE id=?
+      `)
+      .bind(body.post_id)
+      .first();
+
+      if(!post){
+        return json({
+          success:false,
+          error:"Post not found"
+        },404);
+      }
+
+      if(post.customer_id!==body.customer_id){
+        return json({
+          success:false,
+          error:"Unauthorized"
+        },403);
+      }
+
+      await env.CREEK_EXPLORER_DB.prepare(`
+        DELETE FROM creek_talk_posts
+        WHERE id=?
+      `)
+      .bind(body.post_id)
+      .run();
+
+      return json({
+        success:true
+      });
+    }
+
+    return json({
+      success:false,
+      error:"Not Found"
+    },404);
+
+    function json(data,status=200){
+      return new Response(JSON.stringify(data),{
+        status,
+        headers:{
+          "Content-Type":"application/json",
+          ...cors
+        }
+      });
+    }
+
+  }
+}

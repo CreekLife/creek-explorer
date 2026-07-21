@@ -1,0 +1,661 @@
+const OVERPASS_ENDPOINTS = [
+  "https://overpass-api.de/api/interpreter",
+  "https://overpass.kumi.systems/api/interpreter",
+  "https://overpass.nchc.org.tw/api/interpreter"
+];
+
+const DEFAULT_RADIUS_METERS = 18000;
+const MAX_RADIUS_METERS = 35000;
+const PACKAGE_TTL_MS = 1000 * 60 * 60 * 24 * 30;
+const BUILD_LEASE_MS = 1000 * 60 * 3;
+const PACKAGE_VERSION = "3.1-access-engine";
+
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+
+    if (request.method === "OPTIONS") return new Response(null, { headers: corsHeaders() });
+    if (request.method !== "GET") return json({ error: "Method not allowed" }, 405);
+
+    if (url.pathname === "/" || url.pathname === "/health") {
+      return json({
+        ok: true,
+        service: "creek-map-api",
+        version: PACKAGE_VERSION,
+        mode: "D1-first background map packages"
+      });
+    }
+
+    if (url.pathname === "/explore-creeks") {
+      return handleExploreCreeks(url, env);
+    }
+
+    if (url.pathname === "/map-data") {
+      return handleMapData(url, env, ctx);
+    }
+
+    if (url.pathname === "/build-status") {
+      return handleBuildStatus(url, env);
+    }
+
+    if (url.pathname === "/admin/prebuild") {
+      if (!env.ADMIN_TOKEN || url.searchParams.get("token") !== env.ADMIN_TOKEN) {
+        return json({ error: "Unauthorized" }, 401);
+      }
+      const limit = Math.min(Math.max(Number(url.searchParams.get("limit")) || 1, 1), 5);
+      const results = [];
+      for (let i = 0; i < limit; i += 1) {
+        const result = await buildNextCreek(env);
+        if (!result) break;
+        results.push(result);
+      }
+      return json({ ok: true, built: results.length, results });
+    }
+
+    return json({ error: "Not found" }, 404);
+  },
+
+  async scheduled(_event, env, ctx) {
+    ctx.waitUntil(buildNextCreek(env));
+  }
+};
+
+async function handleExploreCreeks(url, env) {
+  if (!env.CREEK_EXPLORER_DB) return json({ error: "D1 binding missing" }, 500);
+
+  const south = clampNumber(url.searchParams.get("south"), -90, 90);
+  const west = clampNumber(url.searchParams.get("west"), -180, 180);
+  const north = clampNumber(url.searchParams.get("north"), -90, 90);
+  const east = clampNumber(url.searchParams.get("east"), -180, 180);
+  const limit = Math.min(Math.max(Number(url.searchParams.get("limit")) || 1000, 1), 2000);
+
+  if (![south, west, north, east].every(Number.isFinite) || south >= north) {
+    return json({ error: "south, west, north, and east are required" }, 400);
+  }
+
+  try {
+    const query = east >= west
+      ? `SELECT id, name, county, state_code, latitude, longitude,
+          COALESCE(documented_species_count, 0) AS documented_species_count
+         FROM creeks
+         WHERE latitude BETWEEN ?1 AND ?2
+           AND longitude BETWEEN ?3 AND ?4
+           AND latitude IS NOT NULL AND longitude IS NOT NULL
+         LIMIT ?5`
+      : `SELECT id, name, county, state_code, latitude, longitude,
+          COALESCE(documented_species_count, 0) AS documented_species_count
+         FROM creeks
+         WHERE latitude BETWEEN ?1 AND ?2
+           AND (longitude >= ?3 OR longitude <= ?4)
+           AND latitude IS NOT NULL AND longitude IS NOT NULL
+         LIMIT ?5`;
+
+    const result = await env.CREEK_EXPLORER_DB.prepare(query)
+      .bind(south, north, west, east, limit)
+      .all();
+
+    return json({ ok: true, creeks: result.results || [] }, 200, {
+      "Cache-Control": "public, max-age=60"
+    });
+  } catch (error) {
+    // Some older schemas do not have documented_species_count as a physical column.
+    try {
+      const query = east >= west
+        ? `SELECT id, name, county, state_code, latitude, longitude
+           FROM creeks
+           WHERE latitude BETWEEN ?1 AND ?2
+             AND longitude BETWEEN ?3 AND ?4
+             AND latitude IS NOT NULL AND longitude IS NOT NULL
+           LIMIT ?5`
+        : `SELECT id, name, county, state_code, latitude, longitude
+           FROM creeks
+           WHERE latitude BETWEEN ?1 AND ?2
+             AND (longitude >= ?3 OR longitude <= ?4)
+             AND latitude IS NOT NULL AND longitude IS NOT NULL
+           LIMIT ?5`;
+      const result = await env.CREEK_EXPLORER_DB.prepare(query)
+        .bind(south, north, west, east, limit)
+        .all();
+      return json({ ok: true, creeks: result.results || [] });
+    } catch (fallbackError) {
+      return json({ error: "Explore creeks failed", detail: String(fallbackError) }, 500);
+    }
+  }
+}
+
+async function handleMapData(url, env, ctx) {
+  const requestInfo = parseCreekRequest(url);
+  if (requestInfo.error) return json({ error: requestInfo.error }, 400);
+
+  const force = url.searchParams.get("refresh") === "1";
+  const wait = url.searchParams.get("wait") === "1";
+
+  const stored = await readPackage(env, requestInfo.creekId);
+  let storedPayload = null;
+  try {
+    storedPayload = stored?.payload_json ? JSON.parse(stored.payload_json) : null;
+  } catch {
+    storedPayload = null;
+  }
+
+  const currentVersion = storedPayload?.version === PACKAGE_VERSION;
+  const fresh = stored && stored.status === "ready" && currentVersion && Number(stored.expires_at) > Date.now();
+
+  if (fresh && !force) {
+    return json({ ...storedPayload, cache: "d1-package", building: false }, 200, {
+      "Cache-Control": "public, max-age=300"
+    });
+  }
+
+  if (stored?.status === "ready" && storedPayload && currentVersion && !force) {
+    ctx.waitUntil(buildAndStorePackage(env, requestInfo));
+    return json({ ...storedPayload, cache: "stale-d1-package", building: true }, 200);
+  }
+
+  if (wait) {
+    try {
+      const payload = await buildAndStorePackage(env, requestInfo, true);
+      return json({ ...payload, cache: "live-build", building: false });
+    } catch (error) {
+      return json({ error: "Map build failed", detail: String(error) }, 502);
+    }
+  }
+
+  const claimed = await claimBuild(env, requestInfo);
+  if (claimed) ctx.waitUntil(buildAndStorePackage(env, requestInfo, true));
+
+  return json({
+    ok: true,
+    building: true,
+    cache: "building",
+    request: requestInfo,
+    creek: { type: "FeatureCollection", features: [] },
+    access: { type: "FeatureCollection", features: [] },
+    counts: {},
+    notice: "The creek map package is being built in the background. Fish information remains available immediately."
+  }, 202, { "Cache-Control": "no-store" });
+}
+
+async function handleBuildStatus(url, env) {
+  const creekId = cleanText(url.searchParams.get("creek_id"), 60);
+  if (!creekId) return json({ error: "creek_id is required" }, 400);
+
+  const row = await readPackage(env, creekId);
+  if (!row) return json({ ok: true, status: "missing" });
+
+  if (row.status === "ready" && row.payload_json) {
+    return json({
+      ok: true,
+      status: "ready",
+      payload: JSON.parse(row.payload_json),
+      updatedAt: row.updated_at,
+      expiresAt: row.expires_at
+    });
+  }
+
+  return json({ ok: true, status: row.status || "building", updatedAt: row.updated_at, error: row.last_error || null });
+}
+
+function parseCreekRequest(url) {
+  const creekId = cleanText(url.searchParams.get("creek_id"), 60);
+  const name = cleanText(url.searchParams.get("name"), 140);
+  const county = cleanText(url.searchParams.get("county"), 100);
+  const state = cleanText(url.searchParams.get("state"), 10).toUpperCase();
+  const lat = Number(url.searchParams.get("lat"));
+  const lon = Number(url.searchParams.get("lon"));
+  const radius = Math.min(Math.max(Number(url.searchParams.get("radius")) || DEFAULT_RADIUS_METERS, 3000), MAX_RADIUS_METERS);
+
+  if (!creekId || !name || !Number.isFinite(lat) || !Number.isFinite(lon)) {
+    return { error: "creek_id, name, lat, and lon are required" };
+  }
+  return { creekId, name, county: county || null, state: state || null, lat, lon, radius };
+}
+
+async function buildAndStorePackage(env, requestInfo, alreadyClaimed = false) {
+  if (!alreadyClaimed) {
+    const claimed = await claimBuild(env, requestInfo);
+    if (!claimed) {
+      const existing = await readPackage(env, requestInfo.creekId);
+      if (existing?.status === "ready" && existing.payload_json) return JSON.parse(existing.payload_json);
+    }
+  }
+
+  try {
+    const query = buildOverpassQuery(requestInfo);
+    const osm = await fetchOverpass(query);
+    const payload = transformOsm(osm, requestInfo);
+
+    if (!payload.creek.features.length) {
+      const fallbackOsm = await fetchOverpass(buildFallbackCreekQuery(requestInfo));
+      const fallback = transformOsm(fallbackOsm, requestInfo, true);
+      payload.creek = fallback.creek;
+      payload.match = fallback.match;
+    }
+
+    const complete = {
+      ...payload,
+      generatedAt: new Date().toISOString(),
+      version: PACKAGE_VERSION
+    };
+
+    await env.CREEK_EXPLORER_DB.prepare(`
+      INSERT INTO creek_map_packages
+        (creek_id, creek_name, latitude, longitude, radius_meters, status, payload_json, updated_at, expires_at, last_error)
+      VALUES (?1, ?2, ?3, ?4, ?5, 'ready', ?6, ?7, ?8, NULL)
+      ON CONFLICT(creek_id) DO UPDATE SET
+        creek_name=excluded.creek_name,
+        latitude=excluded.latitude,
+        longitude=excluded.longitude,
+        radius_meters=excluded.radius_meters,
+        status='ready',
+        payload_json=excluded.payload_json,
+        updated_at=excluded.updated_at,
+        expires_at=excluded.expires_at,
+        last_error=NULL
+    `).bind(
+      String(requestInfo.creekId), requestInfo.name, requestInfo.lat, requestInfo.lon,
+      requestInfo.radius, JSON.stringify(complete), Date.now(), Date.now() + PACKAGE_TTL_MS
+    ).run();
+
+    return complete;
+  } catch (error) {
+    await env.CREEK_EXPLORER_DB.prepare(`
+      UPDATE creek_map_packages
+      SET status='error', updated_at=?2, last_error=?3
+      WHERE creek_id=?1
+    `).bind(String(requestInfo.creekId), Date.now(), String(error).slice(0, 1000)).run();
+    throw error;
+  }
+}
+
+async function claimBuild(env, requestInfo) {
+  if (!env?.CREEK_EXPLORER_DB) return false;
+  const now = Date.now();
+  const leaseExpired = now - BUILD_LEASE_MS;
+
+  const result = await env.CREEK_EXPLORER_DB.prepare(`
+    INSERT INTO creek_map_packages
+      (creek_id, creek_name, latitude, longitude, radius_meters, status, payload_json, updated_at, expires_at, last_error)
+    VALUES (?1, ?2, ?3, ?4, ?5, 'building', NULL, ?6, 0, NULL)
+    ON CONFLICT(creek_id) DO UPDATE SET
+      creek_name=excluded.creek_name,
+      latitude=excluded.latitude,
+      longitude=excluded.longitude,
+      radius_meters=excluded.radius_meters,
+      status='building',
+      updated_at=excluded.updated_at,
+      last_error=NULL
+    WHERE creek_map_packages.status != 'building'
+       OR creek_map_packages.updated_at < ?7
+  `).bind(
+    String(requestInfo.creekId), requestInfo.name, requestInfo.lat, requestInfo.lon,
+    requestInfo.radius, now, leaseExpired
+  ).run();
+
+  return Number(result.meta?.changes || 0) > 0;
+}
+
+async function readPackage(env, creekId) {
+  if (!env?.CREEK_EXPLORER_DB) return null;
+  return env.CREEK_EXPLORER_DB.prepare(`
+    SELECT creek_id, status, payload_json, updated_at, expires_at, last_error
+    FROM creek_map_packages WHERE creek_id=?1
+  `).bind(String(creekId)).first();
+}
+
+async function buildNextCreek(env) {
+  if (!env?.CREEK_EXPLORER_DB) return null;
+
+  const row = await env.CREEK_EXPLORER_DB.prepare(`
+    SELECT c.id, c.name, c.county, c.state_code, c.latitude, c.longitude
+    FROM creeks c
+    LEFT JOIN creek_map_packages p ON CAST(p.creek_id AS TEXT)=CAST(c.id AS TEXT)
+    WHERE c.latitude IS NOT NULL AND c.longitude IS NOT NULL
+      AND (p.creek_id IS NULL OR p.status='error' OR p.expires_at < ?1)
+    ORDER BY CASE WHEN p.creek_id IS NULL THEN 0 ELSE 1 END, COALESCE(p.updated_at, 0) ASC
+    LIMIT 1
+  `).bind(Date.now()).first();
+
+  if (!row) return null;
+
+  const requestInfo = {
+    creekId: String(row.id),
+    name: row.name,
+    county: row.county || null,
+    state: row.state_code || null,
+    lat: Number(row.latitude),
+    lon: Number(row.longitude),
+    radius: DEFAULT_RADIUS_METERS
+  };
+
+  await buildAndStorePackage(env, requestInfo);
+  return { creekId: requestInfo.creekId, name: requestInfo.name };
+}
+
+function clampNumber(value, min, max) {
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.min(Math.max(number, min), max) : NaN;
+}
+
+function buildOverpassQuery({ name, lat, lon, radius }) {
+  const variants = nameVariants(name).map(escapeOverpassRegex).filter(Boolean);
+  const nameRegex = variants.length ? `(${variants.join("|")})` : escapeOverpassRegex(name);
+
+  return `[out:json][timeout:70];
+(
+  way(around:${radius},${lat},${lon})[waterway~"^(river|stream|canal|drain|ditch)$"][name~"${nameRegex}",i];
+  relation(around:${radius},${lat},${lon})[waterway~"^(river|stream|canal|drain|ditch)$"][name~"${nameRegex}",i];
+  relation(around:${radius},${lat},${lon})[type=waterway][name~"${nameRegex}",i];
+
+  nwr(around:${radius},${lat},${lon})[leisure=slipway];
+  nwr(around:${radius},${lat},${lon})[amenity=boat_launch];
+  nwr(around:${radius},${lat},${lon})[canoe=put_in];
+  nwr(around:${radius},${lat},${lon})[kayak=put_in];
+  nwr(around:${radius},${lat},${lon})[whitewater~"^(put_in|egress)$"];
+  nwr(around:${radius},${lat},${lon})[waterway=access_point];
+  nwr(around:${radius},${lat},${lon})[leisure=fishing];
+  nwr(around:${radius},${lat},${lon})[amenity=fishing];
+  nwr(around:${radius},${lat},${lon})[fishing=yes];
+  nwr(around:${radius},${lat},${lon})[man_made~"^(pier|jetty)$"];
+  nwr(around:${radius},${lat},${lon})[highway=trailhead];
+  nwr(around:${radius},${lat},${lon})[information=trailhead];
+  nwr(around:${radius},${lat},${lon})[route~"^(hiking|foot|bicycle|canoe)$"];
+  nwr(around:${radius},${lat},${lon})[highway~"^(path|footway|cycleway|bridleway)$"][name];
+  nwr(around:${radius},${lat},${lon})[leisure~"^(park|nature_reserve|recreation_ground)$"];
+  nwr(around:${radius},${lat},${lon})[boundary~"^(protected_area|national_park)$"];
+  nwr(around:${radius},${lat},${lon})[landuse~"^(recreation_ground|forest|conservation)$"][access!="private"];
+  nwr(around:${radius},${lat},${lon})[amenity=parking][access!="private"];
+  nwr(around:${radius},${lat},${lon})[amenity=parking_entrance][access!="private"];
+  nwr(around:${radius},${lat},${lon})[parking=layby][access!="private"];
+  nwr(around:${radius},${lat},${lon})[amenity=toilets][access!="private"];
+  nwr(around:${radius},${lat},${lon})[amenity=drinking_water];
+  nwr(around:${radius},${lat},${lon})[amenity=shelter];
+  nwr(around:${radius},${lat},${lon})[tourism~"^(camp_site|caravan_site|picnic_site|viewpoint)$"];
+  nwr(around:${radius},${lat},${lon})[leisure=picnic_table];
+  nwr(around:${radius},${lat},${lon})[highway][bridge][access!="private"];
+  nwr(around:${radius},${lat},${lon})[highway][ford][access!="private"];
+  nwr(around:${radius},${lat},${lon})[ford][access!="private"];
+  nwr(around:${radius},${lat},${lon})[waterway][tunnel=culvert][access!="private"];
+);
+out tags center geom;`;
+}
+function buildFallbackCreekQuery({ name, lat, lon, radius }) {
+  const base = escapeOverpassRegex(stripWaterType(name));
+  const expanded = Math.min(Math.round(radius * 1.75), MAX_RADIUS_METERS);
+  return `[out:json][timeout:45];
+(
+  way(around:${expanded},${lat},${lon})[waterway~"^(river|stream|canal|drain|ditch)$"][name~"${base}",i];
+  relation(around:${expanded},${lat},${lon})[waterway~"^(river|stream|canal|drain|ditch)$"][name~"${base}",i];
+  relation(around:${expanded},${lat},${lon})[type=waterway][name~"${base}",i];
+);
+out tags geom;`;
+}
+
+async function fetchOverpass(query) {
+  let lastError = null;
+  for (const endpoint of OVERPASS_ENDPOINTS) {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 58000);
+      const response = await fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8", "User-Agent": "Creek-Life-Creek-Explorer/3.0" },
+        body: new URLSearchParams({ data: query }).toString(),
+        signal: controller.signal
+      });
+      clearTimeout(timeout);
+      if (!response.ok) throw new Error(`Overpass returned ${response.status}`);
+      return await response.json();
+    } catch (error) { lastError = error; }
+  }
+  throw lastError || new Error("Every Overpass endpoint failed");
+}
+
+function transformOsm(osm, requestInfo, fallbackOnly = false) {
+  const creekCandidates = [];
+  const accessFeatures = [];
+  const seenAccess = new Set();
+
+  for (const element of osm.elements || []) {
+    const tags = element.tags || {};
+    if (!fallbackOnly) {
+      const category = classifyAccess(tags);
+      if (category && !isPrivate(tags)) {
+        const point = elementPoint(element);
+        if (point) {
+          const id = `${element.type}/${element.id}`;
+          if (!seenAccess.has(id)) {
+            seenAccess.add(id);
+            accessFeatures.push(makeAccessFeature(element, category, point));
+          }
+        }
+      }
+    }
+
+    if ((tags.waterway || tags.type === "waterway") && tags.name && tags.waterway !== "access_point") {
+      const score = creekMatchScore(element, requestInfo);
+      if (score > 0) creekCandidates.push({ element, score });
+    }
+  }
+
+  creekCandidates.sort((a, b) => b.score - a.score);
+  const bestScore = creekCandidates[0]?.score || 0;
+  const selected = creekCandidates.filter((candidate) => candidate.score >= Math.max(bestScore - 18, 35)).slice(0, 80);
+  const creekFeatures = [];
+  const seenCreek = new Set();
+  selected.forEach(({ element }) => appendCreekGeometry(element, creekFeatures, seenCreek));
+
+  return {
+    ok: true,
+    source: "OpenStreetMap contributors via Overpass API",
+    notice: "Mapped features are informational. Confirm ownership, rules, hours, parking, and legal public access before entering any property.",
+    request: requestInfo,
+    match: {
+      method: fallbackOnly ? "expanded-name-fallback" : "name-and-distance",
+      candidateCount: creekCandidates.length,
+      selectedCount: selected.length,
+      bestScore,
+      matchedName: selected[0]?.element?.tags?.name || null
+    },
+    creek: { type: "FeatureCollection", features: creekFeatures },
+    access: { type: "FeatureCollection", features: filterAccessForSelectedCreek(accessFeatures, creekFeatures) },
+    counts: countCategories(filterAccessForSelectedCreek(accessFeatures, creekFeatures))
+  };
+}
+
+function filterAccessForSelectedCreek(features, creekFeatures) {
+  if (!creekFeatures.length) return features;
+
+  const creekPoints = [];
+  for (const feature of creekFeatures) {
+    const coordinates = feature?.geometry?.coordinates;
+    if (!Array.isArray(coordinates)) continue;
+    for (const coordinate of coordinates) {
+      if (Array.isArray(coordinate) && coordinate.length >= 2) {
+        creekPoints.push({ lon: Number(coordinate[0]), lat: Number(coordinate[1]) });
+      }
+    }
+  }
+
+  if (!creekPoints.length) return features;
+
+  return features.filter((feature) => {
+    if (feature?.properties?.category !== "road-crossing") return true;
+    const coordinate = feature?.geometry?.coordinates;
+    if (!Array.isArray(coordinate) || coordinate.length < 2) return false;
+    const lon = Number(coordinate[0]);
+    const lat = Number(coordinate[1]);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return false;
+
+    let nearestKm = Infinity;
+    for (const point of creekPoints) {
+      const distance = haversineKm(lat, lon, point.lat, point.lon);
+      if (distance < nearestKm) nearestKm = distance;
+      if (nearestKm <= 0.45) return true;
+    }
+    return false;
+  });
+}
+
+function makeAccessFeature(element, category, point) {
+  const tags = element.tags || {};
+  const id = `${element.type}/${element.id}`;
+  return {
+    type: "Feature", id,
+    geometry: { type: "Point", coordinates: [point.lon, point.lat] },
+    properties: {
+      osmId: id, category,
+      name: tags.name || defaultAccessName(category),
+      description: tags.description || tags.note || null,
+      access: tags.access || null,
+      operator: tags.operator || null,
+      surface: tags.surface || null,
+      fee: tags.fee || null,
+      wheelchair: tags.wheelchair || null,
+      toilets: tags.toilets || null,
+      drinkingWater: tags.drinking_water || null,
+      parking: tags.parking || null,
+      openingHours: tags.opening_hours || null,
+      website: safeUrl(tags.website || tags.contact_website),
+      phone: tags.phone || tags.contact_phone || null,
+      caution: category === "road-crossing" ? "Road or ford crossing only. This does not confirm parking or legal stream access." : null,
+      osmUrl: `https://www.openstreetmap.org/${element.type}/${element.id}`
+    }
+  };
+}
+
+function creekMatchScore(element, requestInfo) {
+  const tags = element.tags || {};
+  const candidateName = normalizeName(tags.name);
+  const requestedName = normalizeName(requestInfo.name);
+  const candidateBase = normalizeName(stripWaterType(tags.name));
+  const requestedBase = normalizeName(stripWaterType(requestInfo.name));
+  let score = 0;
+
+  if (candidateName === requestedName) score += 100;
+  else if (candidateBase === requestedBase) score += 85;
+  else if (candidateBase.includes(requestedBase) || requestedBase.includes(candidateBase)) score += 55;
+  else {
+    const overlap = tokenOverlap(candidateBase, requestedBase);
+    score += overlap * 45;
+  }
+
+  const point = elementPoint(element);
+  if (point) {
+    const km = haversineKm(requestInfo.lat, requestInfo.lon, point.lat, point.lon);
+    score += Math.max(0, 35 - km * 1.5);
+  }
+
+  if (tags.waterway === "stream" || tags.waterway === "river") score += 5;
+  return score;
+}
+
+function appendCreekGeometry(element, features, seen) {
+  if (element.type === "way" && Array.isArray(element.geometry)) {
+    pushLine(`way/${element.id}`, element.geometry, element.tags, features, seen);
+    return;
+  }
+  if (element.type === "relation" && Array.isArray(element.members)) {
+    element.members.forEach((member, index) => {
+      if (Array.isArray(member.geometry)) pushLine(`relation/${element.id}/member/${index}`, member.geometry, element.tags, features, seen);
+    });
+  }
+}
+
+function pushLine(id, geometry, tags, features, seen) {
+  const coordinates = geometry.filter(validPoint).map((point) => [point.lon, point.lat]);
+  if (coordinates.length < 2 || seen.has(id)) return;
+  seen.add(id);
+  features.push({
+    type: "Feature", id,
+    geometry: { type: "LineString", coordinates },
+    properties: { name: tags?.name || "Selected creek", waterway: tags?.waterway || "stream", intermittent: tags?.intermittent || null, osmId: id }
+  });
+}
+
+function classifyAccess(tags) {
+  if (tags.leisure === "slipway" || tags.amenity === "boat_launch") return "boat-ramp";
+  if (tags.canoe === "put_in" || tags.kayak === "put_in" || ["put_in", "egress"].includes(tags.whitewater)) return "kayak-launch";
+  if (tags.waterway === "access_point" || tags.route === "canoe") return "watercraft";
+  if (tags.leisure === "fishing" || tags.amenity === "fishing" || tags.fishing === "yes") return "fishing-access";
+  if (tags.man_made === "pier" || tags.man_made === "jetty") return "pier";
+  if (tags.highway === "trailhead" || tags.information === "trailhead") return "trailhead";
+  if (tags.route === "hiking" || tags.route === "foot" || tags.route === "bicycle") return "greenway";
+  if (["path", "footway", "cycleway"].includes(tags.highway) && tags.name) return "greenway";
+  if (["parking", "parking_entrance"].includes(tags.amenity) || tags.parking === "layby") return "parking";
+  if (tags.tourism === "camp_site" || tags.tourism === "caravan_site") return "campground";
+  if (tags.tourism === "picnic_site" || tags.leisure === "picnic_table") return "picnic";
+  if (tags.amenity === "toilets") return "restroom";
+  if (tags.amenity === "drinking_water") return "drinking-water";
+  if (tags.amenity === "shelter") return "shelter";
+  if (tags.tourism === "viewpoint") return "viewpoint";
+  if (["park", "recreation_ground"].includes(tags.leisure)) return "park";
+  if (tags.leisure === "nature_reserve" || ["protected_area", "national_park"].includes(tags.boundary) || ["forest", "conservation"].includes(tags.landuse)) return "public-land";
+  if ((tags.bridge && tags.highway) || tags.ford || (tags.waterway && tags.tunnel === "culvert")) return "road-crossing";
+  return null;
+}
+
+function isPrivate(tags) {
+  return ["private", "no", "customers"].includes(String(tags.access || "").toLowerCase());
+}
+
+function elementPoint(element) {
+  if (Number.isFinite(element.lat) && Number.isFinite(element.lon)) return { lat: element.lat, lon: element.lon };
+  if (element.center && Number.isFinite(element.center.lat) && Number.isFinite(element.center.lon)) return element.center;
+  if (Array.isArray(element.geometry) && element.geometry.length) {
+    const points = element.geometry.filter(validPoint);
+    if (!points.length) return null;
+    return points.reduce((sum, point) => ({ lat: sum.lat + point.lat / points.length, lon: sum.lon + point.lon / points.length }), { lat: 0, lon: 0 });
+  }
+  return null;
+}
+
+function countCategories(features) {
+  return features.reduce((counts, feature) => {
+    const category = feature.properties.category;
+    counts[category] = (counts[category] || 0) + 1;
+    return counts;
+  }, {});
+}
+
+function defaultAccessName(category) {
+  const labels = {
+    "boat-ramp": "Boat Ramp", "kayak-launch": "Kayak / Canoe Put-in", watercraft: "Watercraft Access",
+    "fishing-access": "Fishing Access", pier: "Fishing Pier", trailhead: "Trailhead", greenway: "Greenway / Trail",
+    parking: "Public Parking", campground: "Campground", picnic: "Picnic Area", restroom: "Restroom",
+    "drinking-water": "Drinking Water", shelter: "Shelter", viewpoint: "Scenic Viewpoint", park: "Park",
+    "public-land": "Public Land", "road-crossing": "Public Road Crossing"
+  };
+  return labels[category] || "Mapped Access";
+}
+
+function nameVariants(value) {
+  const clean = String(value || "").trim();
+  const base = stripWaterType(clean);
+  const suffixes = ["Creek", "River", "Fork", "Branch", "Run", "Stream"];
+  return [...new Set([clean, base, ...suffixes.map((suffix) => `${base} ${suffix}`)])].filter((item) => item.length >= 3);
+}
+
+function stripWaterType(value) {
+  return String(value || "").replace(/\b(creek|river|fork|branch|run|stream|brook|ditch)\b/gi, " ").replace(/\s+/g, " ").trim();
+}
+function normalizeName(value) { return String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim(); }
+function tokenOverlap(a, b) {
+  const aa = new Set(String(a).split(/\s+/).filter(Boolean));
+  const bb = new Set(String(b).split(/\s+/).filter(Boolean));
+  if (!aa.size || !bb.size) return 0;
+  let common = 0; aa.forEach((token) => { if (bb.has(token)) common += 1; });
+  return common / Math.max(aa.size, bb.size);
+}
+function haversineKm(lat1, lon1, lat2, lon2) {
+  const r = 6371; const toRad = (n) => n * Math.PI / 180;
+  const dLat = toRad(lat2 - lat1); const dLon = toRad(lon2 - lon1);
+  const a = Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)**2;
+  return r * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+}
+function escapeOverpassRegex(value) { return String(value).replace(/[\^$.*+?()[\]{}|]/g, "\\$&").replace(/"/g, "\\\""); }
+function cleanText(value, maxLength) { return String(value || "").trim().slice(0, maxLength); }
+function safeUrl(value) { if (!value) return null; try { const url = new URL(value); return ["http:", "https:"].includes(url.protocol) ? url.href : null; } catch { return null; } }
+function validPoint(point) { return point && Number.isFinite(point.lat) && Number.isFinite(point.lon); }
+function corsHeaders() { return { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET, OPTIONS", "Access-Control-Allow-Headers": "Content-Type" }; }
+function json(data, status = 200, extraHeaders = {}) { return new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json; charset=UTF-8", ...corsHeaders(), ...extraHeaders } }); }
