@@ -1,0 +1,123 @@
+{% comment %}Creek Explorer V2 + Public Access Map Layers{% endcomment %}
+
+<script>
+window.CREEK_LIFE_CUSTOMER = {
+  loggedIn: {% if customer %}true{% else %}false{% endif %},
+  id: {% if customer %}{{ customer.id | json }}{% else %}null{% endif %},
+  name: {% if customer %}{{ customer.first_name | append: ' ' | append: customer.last_name | strip | json }}{% else %}null{% endif %},
+  firstName: {% if customer %}{{ customer.first_name | json }}{% else %}null{% endif %},
+  lastName: {% if customer %}{{ customer.last_name | json }}{% else %}null{% endif %},
+  email: {% if customer %}{{ customer.email | json }}{% else %}null{% endif %},
+  loginUrl: {{ routes.account_login_url | json }}
+};
+</script>
+
+{{ 'creek-explorer.css' | asset_url | stylesheet_tag }}
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css">
+<link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css">
+
+<style>
+  .ce-map-wrap{position:relative}.ce-map-tools{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:12px;background:#10291e;border:1px solid rgba(244,231,200,.18);border-bottom:0;border-radius:14px 14px 0 0}.ce-layer-toggle{display:inline-flex;align-items:center;gap:7px;padding:8px 10px;border:1px solid rgba(244,231,200,.18);border-radius:999px;background:rgba(255,255,255,.04);color:#f4e7c8;font:700 11px Arial,sans-serif;cursor:pointer}.ce-layer-toggle input{accent-color:#ed7b27}.ce-layer-toggle b{display:inline-grid;place-items:center;min-width:20px;height:20px;padding:0 5px;border-radius:999px;background:#ed7b27;color:#10291e;font-size:10px}.ce-map-status{margin-left:auto;color:#d9caa6;font:700 11px Arial,sans-serif}.ce-map-notice{padding:9px 12px;background:#142f23;color:#c9bb9a;font:12px/1.4 Arial,sans-serif;border-left:1px solid rgba(244,231,200,.18);border-right:1px solid rgba(244,231,200,.18)}.ce-map{border-radius:0 0 14px 14px!important}.ce-access-icon{background:transparent;border:0}.ce-access-pin{display:grid;place-items:center;width:30px;height:30px;border:2px solid #f4e7c8;border-radius:50%;background:#ed7b27;box-shadow:0 3px 10px rgba(0,0,0,.35);font-size:15px}.ce-access-popup h3{margin:0 0 5px;font-size:15px}.ce-access-popup p{margin:4px 0}.ce-access-popup a{font-weight:700}.ce-map-legend{display:flex;flex-wrap:wrap;gap:10px;padding:10px 12px;background:#10291e;color:#f4e7c8;border:1px solid rgba(244,231,200,.18);border-top:0;font:11px Arial,sans-serif}.ce-map-legend span{display:inline-flex;align-items:center;gap:5px}.ce-map-legend i{font-style:normal}.ce-creek-map-line{filter:drop-shadow(0 0 5px rgba(35,166,255,.9))}.ce-explore-creek-icon{background:transparent;border:0}.ce-explore-creek-icon span{display:inline-flex;align-items:center;gap:5px;white-space:nowrap;padding:4px 7px;border-radius:999px;background:rgba(16,41,30,.88);border:1px solid rgba(244,231,200,.42);color:#f4e7c8;font:700 11px Arial,sans-serif;box-shadow:0 2px 8px rgba(0,0,0,.28)}.ce-explore-creek-icon b{color:#20a7ff;font-size:17px;line-height:1}.marker-cluster-small,.marker-cluster-medium,.marker-cluster-large{background:rgba(237,123,39,.28)}.marker-cluster-small div,.marker-cluster-medium div,.marker-cluster-large div{background:#ed7b27;color:#10291e;font-weight:800}@media(max-width:749px){.ce-map-status{width:100%;margin-left:0}.ce-map-tools{border-radius:10px 10px 0 0}.ce-layer-toggle{font-size:10px;padding:7px 8px}}
+</style>
+
+<div
+  id="creek-explorer-app"
+  data-api-base="https://creek-explorer-api.katiebug11819.workers.dev"
+  data-map-api-base="https://creek-map-api.katiebug11819.workers.dev"
+  data-find-save-url="/apps/creek-explorer/found"
+  data-talk-create-url="/apps/creek-explorer/creek-talk/posts/create"
+>
+  <div class="ce-shell">
+    <header class="ce-hero">
+      <div class="ce-eyebrow">CREEK LIFE EXPLORER</div>
+      <h1>Explore the Creek.</h1>
+      <p>Pan, zoom, and click any documented creek. See its fish, trace the water, and find mapped public access nearby.</p>
+    </header>
+
+    <section class="ce-support">
+      <div class="ce-support-copy">
+        <strong>Help Keep Creek Explorer Growing</strong>
+        <span>This project is free to use. Donations help us add documented creeks, fish records, identification photos, access information, and community tools.</span>
+      </div>
+      <form action="https://www.paypal.com/donate" method="post" target="_blank">
+        <input type="hidden" name="hosted_button_id" value="64TCSFVJYPP7J">
+        <button type="submit" class="ce-button ce-button-primary">DONATE TO THE PROJECT</button>
+      </form>
+    </section>
+
+    <div class="ce-toolbar">
+      <input id="ce-search" type="search" placeholder="Search a creek or county..." autocomplete="off">
+      <select id="ce-state" aria-label="Filter by state"><option value="">ALL STATES</option></select>
+    </div>
+
+    <div class="ce-layout">
+      <aside class="ce-sidebar">
+        <div class="ce-sidebar-head"><span>DOCUMENTED CREEKS</span><strong id="ce-creek-count">0</strong></div>
+        <div id="ce-creek-list" class="ce-creek-list"><div class="ce-loading">Loading the creeks...</div></div>
+      </aside>
+
+      <main class="ce-main">
+        <div class="ce-map-wrap">
+          <div class="ce-map-tools" aria-label="Map layers">
+            <label class="ce-layer-toggle"><input type="checkbox" data-map-layer="creek" checked> Highlight Creek</label>
+            <label class="ce-layer-toggle"><input type="checkbox" data-map-layer="launches" checked> Ramps & Launches <b data-layer-count="launches">0</b></label>
+            <label class="ce-layer-toggle"><input type="checkbox" data-map-layer="fishing" checked> Fishing Access <b data-layer-count="fishing">0</b></label>
+            <label class="ce-layer-toggle"><input type="checkbox" data-map-layer="parks" checked> Parks & Public Land <b data-layer-count="parks">0</b></label>
+            <label class="ce-layer-toggle"><input type="checkbox" data-map-layer="trails" checked> Trails & Greenways <b data-layer-count="trails">0</b></label>
+            <label class="ce-layer-toggle"><input type="checkbox" data-map-layer="crossings" checked> Bridge Crossings <b data-layer-count="crossings">0</b></label>
+            <label class="ce-layer-toggle"><input type="checkbox" data-map-layer="services"> Parking & Services <b data-layer-count="services">0</b></label>
+            <span id="ce-map-status" class="ce-map-status">Choose a creek to load access.</span>
+          </div>
+          <div id="ce-map-notice" class="ce-map-notice">Mapped features are informational. A road crossing is not proof of parking or legal creek entry. Always confirm ownership, hours, rules, and public access before visiting.</div>
+          <div id="ce-map" class="ce-map"></div>
+          <div class="ce-map-legend"><span><i>〰️</i> Selected creek</span><span><i>🛶</i> Launch</span><span><i>🎣</i> Fishing</span><span><i>🌳</i> Park/public land</span><span><i>🥾</i> Trail</span><span><i>🅿️</i> Parking/services</span><span><i>🌉</i> Road crossing</span></div>
+        </div>
+
+        <section id="ce-empty" class="ce-empty"><div class="ce-empty-mark">⌖</div><h2>Choose a creek.</h2><p>Its documented fish and mapped access will show up here.</p></section>
+
+        <section id="ce-creek-panel" class="ce-creek-panel" hidden>
+          <div class="ce-creek-heading">
+            <div><div class="ce-eyebrow">NOW EXPLORING</div><h2 id="ce-creek-name"></h2><p id="ce-creek-location"></p></div>
+            <div class="ce-progress-wrap"><strong id="ce-progress-number">0 / 0</strong><span>FOUND</span></div>
+          </div>
+          <p id="ce-creek-description" class="ce-description"></p>
+          <div class="ce-progress-track"><div id="ce-progress-bar" class="ce-progress-bar"></div></div>
+          <div class="ce-species-title"><h3>Fish of this creek</h3><span id="ce-species-count"></span></div>
+          <div id="ce-species-grid" class="ce-species-grid"></div>
+        </section>
+      </main>
+    </div>
+
+    <section id="ce-talk" class="ce-talk">
+      <div class="ce-section-heading">
+        <div><div class="ce-eyebrow">FROM THE CREEKS</div><h2>Creek Talk</h2><p>Share catches, creek reports, questions, photos, and identification requests.</p></div>
+        <button id="ce-talk-refresh" type="button" class="ce-button ce-button-secondary">REFRESH</button>
+      </div>
+      <div id="ce-talk-login" class="ce-talk-login" hidden><strong>Join the conversation.</strong><span>Sign in with your Creek Life account to post.</span><a id="ce-talk-login-link" class="ce-button ce-button-primary" href="#">SIGN IN</a></div>
+      <form id="ce-talk-form" class="ce-talk-form" hidden>
+        <div class="ce-form-grid">
+          <label><span>POST TYPE</span><select id="ce-talk-type"><option value="discussion">Discussion</option><option value="catch">Catch</option><option value="creek-report">Creek Report</option><option value="help-id">Help ID</option><option value="question">Question</option><option value="creek-photo">Creek Photo</option></select></label>
+          <label><span>LOCATION PRIVACY</span><select id="ce-talk-visibility"><option value="creek">Show Creek</option><option value="general">County / State Only</option><option value="hidden">Hidden</option></select></label>
+          <label><span>CREEK</span><select id="ce-talk-creek"><option value="">No creek selected</option></select></label>
+          <label><span>PHOTO URL</span><input id="ce-talk-photo" type="url" placeholder="Optional image URL"></label>
+        </div>
+        <label class="ce-form-full"><span>WHAT IS HAPPENING IN THE CREEK?</span><textarea id="ce-talk-body" maxlength="3000" required placeholder="Share a catch, creek report, question, or photo..."></textarea></label>
+        <div class="ce-talk-actions"><span id="ce-talk-status"></span><button type="submit" class="ce-button ce-button-primary">POST TO CREEK TALK</button></div>
+      </form>
+      <div id="ce-talk-feed" class="ce-talk-feed"><div class="ce-loading">Loading Creek Talk...</div></div>
+    </section>
+  </div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" defer></script>
+<script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js" defer></script>
+<script src="{{ 'creek-explorer.js' | asset_url }}" defer></script>
+
+{% schema %}
+{
+  "name": "Creek Explorer",
+  "settings": [],
+  "presets": [{ "name": "Creek Explorer" }]
+}
+{% endschema %}

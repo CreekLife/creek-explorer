@@ -1,0 +1,991 @@
+(() => {
+  const root = document.getElementById("creek-explorer-app");
+  if (!root) return;
+
+  const API = root.dataset.apiBase;
+  const MAP_API = root.dataset.mapApiBase;
+  const FIND_SAVE_URL = root.dataset.findSaveUrl;
+  const TALK_API = "https://creek-talk-api.katiebug11819.workers.dev";
+  const STORAGE_KEY = "creekLifeExplorerFoundFishV1";
+
+  const customer = window.CREEK_LIFE_CUSTOMER || {
+    loggedIn: false,
+    id: null,
+    name: null,
+    email: null,
+    loginUrl: "/account/login"
+  };
+
+  const list = document.getElementById("ce-creek-list");
+  const search = document.getElementById("ce-search");
+  const state = document.getElementById("ce-state");
+  const creekCount = document.getElementById("ce-creek-count");
+  const empty = document.getElementById("ce-empty");
+  const panel = document.getElementById("ce-creek-panel");
+  const speciesGrid = document.getElementById("ce-species-grid");
+
+  const talkFeed = document.getElementById("ce-talk-feed");
+  const talkForm = document.getElementById("ce-talk-form");
+  const talkLogin = document.getElementById("ce-talk-login");
+  const talkLoginButton = document.getElementById("ce-talk-login-link");
+  const talkStatus = document.getElementById("ce-talk-status");
+  const talkCreek = document.getElementById("ce-talk-creek");
+  const talkType = document.getElementById("ce-talk-type");
+  const talkVisibility = document.getElementById("ce-talk-visibility");
+  const talkBody = document.getElementById("ce-talk-body");
+  const talkPhoto = document.getElementById("ce-talk-photo");
+  const talkRefresh = document.getElementById("ce-talk-refresh");
+
+  let creeks = [];
+  let activeCreekId = null;
+  let marker = null;
+  let activeMapRequest = 0;
+  let mapBuildPoll = null;
+  let found = {};
+
+  try {
+    found = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
+  } catch {
+    found = {};
+  }
+
+  function escapeHtml(value = "") {
+    return String(value).replace(/[&<>"']/g, (character) => ({
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      '"': "&quot;",
+      "'": "&#039;"
+    })[character]);
+  }
+
+  function formatDisplayName(value = "") {
+    const parts = String(value).trim().split(/\s+/).filter(Boolean);
+
+    if (!parts.length) return "Creek Explorer";
+
+    const firstName =
+      parts[0].charAt(0).toUpperCase() +
+      parts[0].slice(1).toLowerCase();
+
+    if (parts.length === 1) return firstName;
+
+    return `${firstName} ${parts[parts.length - 1].charAt(0).toUpperCase()}.`;
+  }
+
+  function formatDate(value) {
+    if (!value) return "";
+
+    const date = new Date(value);
+
+    return Number.isNaN(date.getTime())
+      ? String(value)
+      : date.toLocaleString([], {
+          dateStyle: "medium",
+          timeStyle: "short"
+        });
+  }
+
+  async function getJson(url, options = {}) {
+    const response = await fetch(url, options);
+
+    let data = null;
+
+    try {
+      data = await response.json();
+    } catch {
+      data = null;
+    }
+
+    if (!response.ok) {
+      throw new Error(
+        data?.error ||
+        data?.detail ||
+        `Request failed: ${response.status}`
+      );
+    }
+
+    return data;
+  }
+
+  const map = L.map("ce-map", {
+    scrollWheelZoom: false
+  }).setView([36.5, -82.35], 8);
+
+  L.tileLayer(
+    "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+    {
+      maxZoom: 19,
+      attribution: "&copy; OpenStreetMap contributors"
+    }
+  ).addTo(map);
+
+
+  const exploreCreekLayer = typeof L.markerClusterGroup === "function"
+    ? L.markerClusterGroup({
+        showCoverageOnHover: false,
+        spiderfyOnMaxZoom: true,
+        disableClusteringAtZoom: 13,
+        maxClusterRadius: 48
+      })
+    : L.layerGroup();
+
+  exploreCreekLayer.addTo(map);
+
+  function creekExploreIcon(creek) {
+    return L.divIcon({
+      className: "ce-explore-creek-icon",
+      html: `<span><b>●</b>${escapeHtml(creek.name || "Creek")}</span>`,
+      iconSize: [170, 28],
+      iconAnchor: [8, 14]
+    });
+  }
+
+  function renderExploreCreeks() {
+    exploreCreekLayer.clearLayers();
+    const bounds = map.getBounds().pad(0.20);
+
+    creeks.forEach((creek) => {
+      const latitude = Number(creek.latitude);
+      const longitude = Number(creek.longitude);
+      if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return;
+      if (!bounds.contains([latitude, longitude])) return;
+
+      const creekMarker = L.marker([latitude, longitude], {
+        icon: creekExploreIcon(creek),
+        title: creek.name || "Creek"
+      });
+
+      creekMarker.on("click", () => selectCreek(creek.id));
+      creekMarker.bindTooltip(
+        `<strong>${escapeHtml(creek.name || "Creek")}</strong><br>${Number(creek.documented_species_count || 0)} documented fish`,
+        { direction: "top", offset: [0, -10] }
+      );
+      if (Number(creek.id) === Number(activeCreekId)) {
+        creekMarker.setZIndexOffset(1000);
+      }
+      exploreCreekLayer.addLayer(creekMarker);
+    });
+  }
+
+  const creekLineLayer = L.geoJSON(null, {
+    style: {
+      color: "#20a7ff",
+      weight: 4,
+      opacity: 0.95,
+      lineCap: "round",
+      lineJoin: "round",
+      className: "ce-creek-map-line"
+    },
+    onEachFeature: (feature, layer) => {
+      layer.on({
+        mouseover: () => layer.setStyle({ weight: 7, opacity: 1 }),
+        mouseout: () => layer.setStyle({ weight: 4, opacity: 0.95 }),
+        click: () => {
+          if (activeCreekId) selectCreek(activeCreekId);
+        }
+      });
+      if (feature?.properties?.name) {
+        layer.bindTooltip(escapeHtml(feature.properties.name), { sticky: true, direction: "top" });
+      }
+    }
+  }).addTo(map);
+
+  const accessLayerGroups = {
+    launches: L.layerGroup().addTo(map),
+    fishing: L.layerGroup().addTo(map),
+    parks: L.layerGroup().addTo(map),
+    trails: L.layerGroup().addTo(map),
+    crossings: L.layerGroup().addTo(map),
+    services: L.layerGroup()
+  };
+
+  const categoryConfig = {
+    "boat-ramp": { group: "launches", icon: "🚤", label: "Boat Ramp" },
+    "kayak-launch": { group: "launches", icon: "🛶", label: "Kayak / Canoe Launch" },
+    watercraft: { group: "launches", icon: "🛶", label: "Watercraft Access" },
+    "fishing-access": { group: "fishing", icon: "🎣", label: "Fishing Access" },
+    pier: { group: "fishing", icon: "🎣", label: "Fishing Pier / Jetty" },
+    park: { group: "parks", icon: "🌳", label: "Park / Recreation Area" },
+    "public-land": { group: "parks", icon: "🌲", label: "Public / Protected Land" },
+    greenway: { group: "trails", icon: "🚶", label: "Greenway / Trail" },
+    trailhead: { group: "trails", icon: "🥾", label: "Trailhead" },
+    parking: { group: "services", icon: "🅿️", label: "Parking / Lay-by" },
+    restroom: { group: "services", icon: "🚻", label: "Restroom" },
+    campground: { group: "services", icon: "🏕️", label: "Campground" },
+    picnic: { group: "services", icon: "🧺", label: "Picnic Area" },
+    "drinking-water": { group: "services", icon: "🚰", label: "Drinking Water" },
+    shelter: { group: "services", icon: "🏠", label: "Public Shelter" },
+    viewpoint: { group: "services", icon: "📷", label: "Scenic Viewpoint" },
+    "road-crossing": { group: "crossings", icon: "🌉", label: "Road / Bridge Crossing" }
+  };
+
+  function clearMapData() {
+    updateLayerCounts({});
+    creekLineLayer.clearLayers();
+    Object.values(accessLayerGroups).forEach((layer) => layer.clearLayers());
+
+    if (marker) {
+      marker.remove();
+      marker = null;
+    }
+  }
+
+  function showCreekOnMap(creek) {
+    if (!creek.latitude || !creek.longitude) return;
+
+    const latitude = Number(creek.latitude);
+    const longitude = Number(creek.longitude);
+
+    if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return;
+
+    marker = L.circleMarker([latitude, longitude], {
+      radius: 5,
+      weight: 2,
+      color: "#f4e7c8",
+      fillColor: "#ed7b27",
+      fillOpacity: 1
+    })
+      .addTo(map)
+      .bindPopup(escapeHtml(creek.name));
+
+    map.flyTo([latitude, longitude], 12);
+  }
+
+  function accessMarkerIcon(category) {
+    const config = categoryConfig[category] || {
+      icon: "⌖",
+      label: "Mapped Access"
+    };
+
+    return L.divIcon({
+      className: "ce-access-icon",
+      html: `<span class="ce-access-pin" title="${escapeHtml(config.label)}">${config.icon}</span>`,
+      iconSize: [30, 30],
+      iconAnchor: [15, 15],
+      popupAnchor: [0, -17]
+    });
+  }
+
+  function accessPopup(feature) {
+    const properties = feature.properties || {};
+    const category = categoryConfig[properties.category] || {
+      label: "Mapped Access"
+    };
+    const [longitude, latitude] = feature.geometry.coordinates;
+    const directionsUrl = `https://www.google.com/maps/dir/?api=1&destination=${latitude},${longitude}`;
+
+    const details = [
+      properties.access ? `<p><strong>Access:</strong> ${escapeHtml(properties.access)}</p>` : "",
+      properties.operator ? `<p><strong>Operator:</strong> ${escapeHtml(properties.operator)}</p>` : "",
+      properties.surface ? `<p><strong>Surface:</strong> ${escapeHtml(properties.surface)}</p>` : "",
+      properties.fee ? `<p><strong>Fee:</strong> ${escapeHtml(properties.fee)}</p>` : "",
+      properties.wheelchair ? `<p><strong>Wheelchair:</strong> ${escapeHtml(properties.wheelchair)}</p>` : "",
+      properties.openingHours ? `<p><strong>Hours:</strong> ${escapeHtml(properties.openingHours)}</p>` : "",
+      properties.caution ? `<p><strong>Caution:</strong> ${escapeHtml(properties.caution)}</p>` : "",
+      properties.description ? `<p>${escapeHtml(properties.description)}</p>` : ""
+    ].join("");
+
+    return `
+      <div class="ce-access-popup">
+        <h3>${escapeHtml(properties.name || category.label)}</h3>
+        <p><strong>${escapeHtml(category.label)}</strong></p>
+        ${details}
+        <p><a href="${directionsUrl}" target="_blank" rel="noopener">Get Directions</a></p>
+        ${properties.osmUrl ? `<p><a href="${escapeHtml(properties.osmUrl)}" target="_blank" rel="noopener">View Map Record</a></p>` : ""}
+      </div>
+    `;
+  }
+
+  function renderMapData(data, creek) {
+    const creekFeatures = data?.creek?.features || [];
+    const accessFeatures = data?.access?.features || [];
+
+    creekLineLayer.addData(data.creek || { type: "FeatureCollection", features: [] });
+
+    accessFeatures.forEach((feature) => {
+      const category = feature?.properties?.category;
+      const config = categoryConfig[category];
+      const coordinates = feature?.geometry?.coordinates;
+
+      if (!config || !Array.isArray(coordinates) || coordinates.length < 2) return;
+
+      const [longitude, latitude] = coordinates;
+      if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return;
+
+      L.marker([latitude, longitude], {
+        icon: accessMarkerIcon(category),
+        title: feature.properties?.name || config.label
+      })
+        .bindPopup(accessPopup(feature))
+        .addTo(accessLayerGroups[config.group]);
+    });
+
+    const boundsLayers = [];
+    if (creekFeatures.length) boundsLayers.push(creekLineLayer);
+    Object.values(accessLayerGroups).forEach((layer) => {
+      if (map.hasLayer(layer) && layer.getLayers().length) boundsLayers.push(layer);
+    });
+
+    if (boundsLayers.length) {
+      const combined = L.featureGroup(boundsLayers);
+      const bounds = combined.getBounds();
+      if (bounds.isValid()) map.fitBounds(bounds.pad(0.12), { maxZoom: 14 });
+    } else {
+      showCreekOnMap(creek);
+    }
+
+    const status = document.getElementById("ce-map-status");
+    const notice = document.getElementById("ce-map-notice");
+
+    if (status) {
+      const matchName = data?.match?.matchedName;
+      status.textContent = creekFeatures.length
+        ? `${creekFeatures.length} creek segments highlighted • ${accessFeatures.length} mapped features${matchName && matchName !== creek.name ? ` • matched ${matchName}` : ""}`
+        : `${accessFeatures.length} mapped features found • creek line still needs a verified geometry match.`;
+    }
+
+    if (notice && data.notice) notice.textContent = data.notice;
+    updateLayerCounts(data.counts || {});
+  }
+
+  function updateLayerCounts(counts) {
+    const totals = {
+      launches: Number(counts["boat-ramp"] || 0) + Number(counts["kayak-launch"] || 0) + Number(counts.watercraft || 0),
+      fishing: Number(counts["fishing-access"] || 0) + Number(counts.pier || 0),
+      parks: Number(counts.park || 0) + Number(counts["public-land"] || 0),
+      trails: Number(counts.greenway || 0) + Number(counts.trailhead || 0),
+      crossings: Number(counts["road-crossing"] || 0),
+      services: Number(counts.parking || 0) + Number(counts.restroom || 0) + Number(counts.campground || 0) + Number(counts.picnic || 0) + Number(counts["drinking-water"] || 0) + Number(counts.shelter || 0) + Number(counts.viewpoint || 0)
+    };
+    Object.entries(totals).forEach(([name, total]) => {
+      const target = document.querySelector(`[data-layer-count="${name}"]`);
+      if (target) target.textContent = String(total);
+    });
+  }
+
+  async function loadMapData(creek) {
+    clearMapData();
+    if (mapBuildPoll) clearTimeout(mapBuildPoll);
+
+    const status = document.getElementById("ce-map-status");
+    if (status) status.textContent = "Loading cached map package...";
+
+    const latitude = Number(creek.latitude);
+    const longitude = Number(creek.longitude);
+
+    if (!MAP_API || MAP_API.includes("YOUR-SUBDOMAIN") || !Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+      if (status) status.textContent = "Map API needs to be connected.";
+      showCreekOnMap(creek);
+      return;
+    }
+
+    showCreekOnMap(creek);
+    const requestId = ++activeMapRequest;
+
+    const url = new URL(`${MAP_API.replace(/\/$/, "")}/map-data`);
+    url.searchParams.set("creek_id", String(creek.id || ""));
+    url.searchParams.set("name", creek.name || "");
+    url.searchParams.set("county", creek.county || "");
+    url.searchParams.set("state", creek.state_code || "");
+    url.searchParams.set("lat", String(latitude));
+    url.searchParams.set("lon", String(longitude));
+    url.searchParams.set("radius", "18000");
+
+    try {
+      const response = await fetch(url.toString());
+      const data = await response.json();
+      if (requestId !== activeMapRequest) return;
+
+      if (response.status === 202 || data.building) {
+        if (status) status.textContent = "Fish loaded. Building this creek's map package in the background...";
+        pollMapBuild(creek, requestId, 0);
+        return;
+      }
+
+      if (!response.ok) throw new Error(data?.error || data?.detail || `Request failed: ${response.status}`);
+      renderMapData(data, creek);
+    } catch (error) {
+      console.error("Creek map data failed:", error);
+      if (requestId !== activeMapRequest) return;
+      if (status) status.textContent = "Mapped access is temporarily unavailable. Fish information is still ready.";
+    }
+  }
+
+  async function pollMapBuild(creek, requestId, attempt) {
+    if (requestId !== activeMapRequest || attempt >= 18) return;
+
+    mapBuildPoll = setTimeout(async () => {
+      try {
+        const statusUrl = new URL(`${MAP_API.replace(/\/$/, "")}/build-status`);
+        statusUrl.searchParams.set("creek_id", String(creek.id));
+        const data = await getJson(statusUrl.toString());
+        if (requestId !== activeMapRequest) return;
+
+        if (data.status === "ready" && data.payload) {
+          renderMapData(data.payload, creek);
+          return;
+        }
+
+        const status = document.getElementById("ce-map-status");
+        if (status) status.textContent = `Fish loaded. Map package building${".".repeat((attempt % 3) + 1)}`;
+        pollMapBuild(creek, requestId, attempt + 1);
+      } catch {
+        pollMapBuild(creek, requestId, attempt + 1);
+      }
+    }, attempt < 4 ? 1200 : 2500);
+  }
+
+  function bindMapLayerToggles() {
+    document.querySelectorAll("[data-map-layer]").forEach((input) => {
+      input.addEventListener("change", () => {
+        const layerName = input.dataset.mapLayer;
+        const layer = layerName === "creek" ? creekLineLayer : accessLayerGroups[layerName];
+        if (!layer) return;
+
+        if (input.checked) {
+          layer.addTo(map);
+        } else {
+          map.removeLayer(layer);
+        }
+      });
+    });
+  }
+
+  async function loadStates() {
+    const stateNames = {
+      AL: "ALABAMA", AK: "ALASKA", AZ: "ARIZONA", AR: "ARKANSAS",
+      CA: "CALIFORNIA", CO: "COLORADO", CT: "CONNECTICUT", DE: "DELAWARE",
+      FL: "FLORIDA", GA: "GEORGIA", HI: "HAWAII", ID: "IDAHO",
+      IL: "ILLINOIS", IN: "INDIANA", IA: "IOWA", KS: "KANSAS",
+      KY: "KENTUCKY", LA: "LOUISIANA", ME: "MAINE", MD: "MARYLAND",
+      MA: "MASSACHUSETTS", MI: "MICHIGAN", MN: "MINNESOTA", MS: "MISSISSIPPI",
+      MO: "MISSOURI", MT: "MONTANA", NE: "NEBRASKA", NV: "NEVADA",
+      NH: "NEW HAMPSHIRE", NJ: "NEW JERSEY", NM: "NEW MEXICO", NY: "NEW YORK",
+      NC: "NORTH CAROLINA", ND: "NORTH DAKOTA", OH: "OHIO", OK: "OKLAHOMA",
+      OR: "OREGON", PA: "PENNSYLVANIA", RI: "RHODE ISLAND",
+      SC: "SOUTH CAROLINA", SD: "SOUTH DAKOTA", TN: "TENNESSEE",
+      TX: "TEXAS", UT: "UTAH", VT: "VERMONT", VA: "VIRGINIA",
+      WA: "WASHINGTON", WV: "WEST VIRGINIA", WI: "WISCONSIN", WY: "WYOMING"
+    };
+
+    try {
+      const data = await getJson(`${API}/creeks/states`);
+
+      state.innerHTML =
+        '<option value="">ALL STATES</option>' +
+        (data.states || [])
+          .map((item) => {
+            const code = String(item.stateCode || "").toUpperCase();
+
+            return `
+              <option value="${escapeHtml(code)}">
+                ${escapeHtml(stateNames[code] || code)}
+                (${Number(item.creekCount || 0)})
+              </option>
+            `;
+          })
+          .join("");
+    } catch (error) {
+      console.error("Creek Explorer state loading failed:", error);
+    }
+  }
+
+  async function loadCreeks() {
+    try {
+      const data = await getJson(`${API}/creeks`);
+      creeks = data.creeks || [];
+
+      renderCreeks();
+      populateTalkCreeks();
+      renderExploreCreeks();
+    } catch (error) {
+      list.innerHTML = `
+        <div class="ce-error">${escapeHtml(error.message)}</div>
+      `;
+    }
+  }
+
+  function renderCreeks() {
+    const term = search.value.trim().toLowerCase();
+    const stateValue = state.value;
+
+    const filtered = creeks.filter((creek) => {
+      const searchable = `
+        ${creek.name || ""}
+        ${creek.county || ""}
+      `.toLowerCase();
+
+      const matchesSearch = !term || searchable.includes(term);
+      const matchesState =
+        !stateValue || creek.state_code === stateValue;
+
+      return matchesSearch && matchesState;
+    });
+
+    creekCount.textContent = filtered.length;
+
+    if (!filtered.length) {
+      list.innerHTML = '<div class="ce-loading">No creeks found.</div>';
+      return;
+    }
+
+    list.innerHTML = filtered
+      .map((creek) => `
+        <button
+          class="ce-creek-button ${
+            Number(creek.id) === Number(activeCreekId)
+              ? "is-active"
+              : ""
+          }"
+          data-creek-id="${creek.id}"
+        >
+          <strong>${escapeHtml(creek.name)}</strong>
+
+          <span>
+            ${escapeHtml(creek.county || "")}
+            ${
+              creek.state_code
+                ? `, ${escapeHtml(creek.state_code)}`
+                : ""
+            }
+          </span>
+
+          <em>
+            ${Number(creek.documented_species_count || 0)}
+            DOCUMENTED FISH
+          </em>
+        </button>
+      `)
+      .join("");
+
+    list
+      .querySelectorAll("[data-creek-id]")
+      .forEach((button) => {
+        button.addEventListener("click", () => {
+          selectCreek(button.dataset.creekId);
+        });
+      });
+  }
+
+  async function selectCreek(id) {
+    activeCreekId = Number(id);
+    renderCreeks();
+    renderExploreCreeks();
+
+    try {
+      const data = await getJson(`${API}/creeks/${id}`);
+      const creek = data.creek;
+      const species = data.documentedSpecies || [];
+
+      empty.hidden = true;
+      panel.hidden = false;
+
+      document.getElementById("ce-creek-name").textContent =
+        creek.name || "";
+
+      document.getElementById("ce-creek-location").textContent =
+        [creek.county, creek.state_code]
+          .filter(Boolean)
+          .join(", ");
+
+      document.getElementById("ce-creek-description").textContent =
+        creek.description || "";
+
+      document.getElementById("ce-species-count").textContent =
+        `${Number(data.count || species.length)} DOCUMENTED SPECIES`;
+
+      renderSpecies(creek, species);
+      loadMapData(creek);
+
+      const activeButton = list.querySelector(`[data-creek-id="${creek.id}"]`);
+      activeButton?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+
+      if (talkCreek) {
+        talkCreek.value = String(creek.id);
+      }
+    } catch (error) {
+      speciesGrid.innerHTML = `
+        <div class="ce-error">${escapeHtml(error.message)}</div>
+      `;
+    }
+  }
+
+  function renderSpecies(creek, species) {
+    speciesGrid.innerHTML = species
+      .map((fish) => {
+        const key = `${creek.id}:${fish.id}`;
+        const isFound = Boolean(found[key]);
+
+        return `
+          <label
+            class="ce-fish-card ${isFound ? "is-found" : ""}"
+            data-fish-card="${escapeHtml(key)}"
+          >
+            <span class="ce-fish-badge">FOUND ✓</span>
+
+            <div class="ce-fish-photo">
+              ${
+                fish.photo_url
+                  ? `
+                    <img
+                      src="${escapeHtml(fish.photo_url)}"
+                      alt="${escapeHtml(fish.common_name)}"
+                      loading="lazy"
+                    >
+                  `
+                  : '<div class="ce-fish-placeholder">🐟</div>'
+              }
+            </div>
+
+            <div class="ce-fish-body">
+              <h4>${escapeHtml(fish.common_name)}</h4>
+              <i>${escapeHtml(fish.scientific_name)}</i>
+
+              <div class="ce-fish-check">
+                <input
+                  type="checkbox"
+                  data-fish-key="${escapeHtml(key)}"
+                  data-fish-id="${fish.id}"
+                  ${isFound ? "checked" : ""}
+                >
+                <span>I'VE FOUND THIS FISH</span>
+              </div>
+            </div>
+          </label>
+        `;
+      })
+      .join("");
+
+    speciesGrid
+      .querySelectorAll("[data-fish-key]")
+      .forEach((input) => {
+        input.addEventListener("change", async (event) => {
+          const checkbox = event.currentTarget;
+          const key = checkbox.dataset.fishKey;
+
+          if (checkbox.checked) {
+            found[key] = true;
+          } else {
+            delete found[key];
+          }
+
+          localStorage.setItem(
+            STORAGE_KEY,
+            JSON.stringify(found)
+          );
+
+          checkbox
+            .closest(".ce-fish-card")
+            ?.classList.toggle("is-found", checkbox.checked);
+
+          updateProgress(creek.id, species);
+
+          try {
+            await getJson(FIND_SAVE_URL, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json"
+              },
+              body: JSON.stringify({
+                creek_id: creek.id,
+                species_id: Number(checkbox.dataset.fishId),
+                found: checkbox.checked
+              })
+            });
+          } catch (error) {
+            console.error(
+              "Creek Explorer found-fish sync failed:",
+              error
+            );
+          }
+        });
+      });
+
+    updateProgress(creek.id, species);
+  }
+
+  function updateProgress(creekId, species) {
+    const total = species.length;
+
+    const checked = species.filter(
+      (fish) => found[`${creekId}:${fish.id}`]
+    ).length;
+
+    const percentage = total
+      ? (checked / total) * 100
+      : 0;
+
+    document.getElementById("ce-progress-number").textContent =
+      `${checked} / ${total}`;
+
+    document.getElementById("ce-progress-bar").style.width =
+      `${percentage}%`;
+  }
+
+  function populateTalkCreeks() {
+    if (!talkCreek) return;
+
+    talkCreek.innerHTML =
+      '<option value="">No creek selected</option>' +
+      creeks
+        .map((creek) => `
+          <option value="${creek.id}">
+            ${escapeHtml(creek.name)}
+            ${
+              creek.state_code
+                ? `, ${escapeHtml(creek.state_code)}`
+                : ""
+            }
+          </option>
+        `)
+        .join("");
+  }
+
+  function normalizeTalkPosts(data) {
+    if (Array.isArray(data)) return data;
+    if (Array.isArray(data?.posts)) return data.posts;
+    return [];
+  }
+
+  async function loadTalk() {
+    if (!talkFeed) return;
+
+    talkFeed.innerHTML =
+      '<div class="ce-loading">Loading Creek Talk...</div>';
+
+    try {
+      const data = await getJson(`${TALK_API}/feed`);
+      const posts = normalizeTalkPosts(data);
+
+      renderTalk(posts);
+    } catch (error) {
+      talkFeed.innerHTML = `
+        <div class="ce-error">${escapeHtml(error.message)}</div>
+      `;
+    }
+  }
+
+  function renderTalk(posts) {
+    if (!posts.length) {
+      talkFeed.innerHTML =
+        '<div class="ce-loading">No Creek Talk posts yet. Be the first one.</div>';
+      return;
+    }
+
+    talkFeed.innerHTML = posts
+      .map((post) => {
+        let location = "Location hidden";
+
+        if (post.visibility === "creek" && post.creek_name) {
+          location = post.creek_name;
+        } else if (post.visibility === "general") {
+          location =
+            [post.county, post.state_code]
+              .filter(Boolean)
+              .join(", ") || "General area";
+        }
+
+        const rawAuthor =
+          post.customer_name ||
+          post.display_name ||
+          "Creek Explorer";
+
+        const author = formatDisplayName(rawAuthor);
+
+        const isOwner =
+          customer.loggedIn &&
+          post.customer_id != null &&
+          String(post.customer_id) === String(customer.id);
+
+        return `
+          <article class="ce-talk-card" data-post-id="${Number(post.id)}">
+            ${
+              post.photo_url
+                ? `
+                  <div class="ce-talk-photo">
+                    <img
+                      src="${escapeHtml(post.photo_url)}"
+                      alt=""
+                      loading="lazy"
+                    >
+                  </div>
+                `
+                : ""
+            }
+
+            <div class="ce-talk-card-body">
+              <div class="ce-talk-meta">
+                <span>
+                  ${escapeHtml(
+                    String(post.post_type || "discussion")
+                      .replaceAll("-", " ")
+                      .toUpperCase()
+                  )}
+                </span>
+
+                <span>
+                  ${escapeHtml(formatDate(post.created_at))}
+                </span>
+              </div>
+
+              <h3>${escapeHtml(author)}</h3>
+
+              <div class="ce-talk-meta">
+                <span>${escapeHtml(location)}</span>
+              </div>
+
+              <p>${escapeHtml(post.body || "")}</p>
+
+              <div class="ce-talk-stats">
+                <span>♥ ${Number(post.like_count || 0)}</span>
+                <span>💬 ${Number(post.comment_count || 0)}</span>
+                ${
+                  isOwner
+                    ? `<button type="button" data-delete-post="${Number(post.id)}" style="margin-left:auto;border:0;background:transparent;color:#ed7b27;cursor:pointer;font:800 11px Arial,sans-serif;letter-spacing:.06em;">DELETE</button>`
+                    : ""
+                }
+              </div>
+            </div>
+          </article>
+        `;
+      })
+      .join("");
+
+    talkFeed
+      .querySelectorAll("[data-delete-post]")
+      .forEach((button) => {
+        button.addEventListener("click", async () => {
+          const postId = Number(button.dataset.deletePost);
+
+          if (!window.confirm("Delete this Creek Talk post?")) return;
+
+          button.disabled = true;
+          button.textContent = "DELETING...";
+
+          try {
+            await getJson(`${TALK_API}/delete`, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json"
+              },
+              body: JSON.stringify({
+                post_id: postId,
+                customer_id: String(customer.id)
+              })
+            });
+
+            await loadTalk();
+          } catch (error) {
+            window.alert(error.message);
+            button.disabled = false;
+            button.textContent = "DELETE";
+          }
+        });
+      });
+  }
+
+  async function submitTalk(event) {
+    event.preventDefault();
+
+    if (!customer.loggedIn) {
+      talkStatus.textContent =
+        "Sign in with your Creek Life account first.";
+      return;
+    }
+
+    const postBody = talkBody.value.trim();
+
+    if (!postBody) {
+      talkStatus.textContent = "Write something before posting.";
+      return;
+    }
+
+    const selectedCreek =
+      talkCreek.options[talkCreek.selectedIndex];
+
+    talkStatus.textContent = "Posting...";
+
+    try {
+      await getJson(`${TALK_API}/create`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          customer_id: String(customer.id),
+          customer_name:
+            customer.name ||
+            "Creek Explorer",
+          creek_id:
+            Number(talkCreek.value) ||
+            null,
+          creek_name:
+            talkCreek.value
+              ? selectedCreek?.text?.trim() || null
+              : null,
+          species_id: null,
+          species_name: null,
+          post_type: talkType.value,
+          body: postBody,
+          photo_url:
+            talkPhoto.value.trim() ||
+            null,
+          visibility: talkVisibility.value
+        })
+      });
+
+      talkForm.reset();
+      talkStatus.textContent = "Posted.";
+
+      if (activeCreekId) {
+        talkCreek.value = String(activeCreekId);
+      }
+
+      await loadTalk();
+    } catch (error) {
+      console.error("Creek Talk posting failed:", error);
+      talkStatus.textContent = error.message;
+    }
+  }
+
+  function configureTalkLogin() {
+    if (!talkLogin || !talkForm) return;
+
+    if (customer.loggedIn) {
+      talkLogin.hidden = true;
+      talkForm.hidden = false;
+    } else {
+      talkLogin.hidden = false;
+      talkForm.hidden = true;
+
+      if (talkLoginButton) {
+        talkLoginButton.href =
+          customer.loginUrl ||
+          "/account/login";
+      }
+    }
+  }
+
+  search.addEventListener("input", renderCreeks);
+  state.addEventListener("change", renderCreeks);
+
+  if (talkRefresh) {
+    talkRefresh.addEventListener("click", loadTalk);
+  }
+
+  if (talkForm) {
+    talkForm.addEventListener("submit", submitTalk);
+  }
+
+  configureTalkLogin();
+  bindMapLayerToggles();
+  map.on("moveend zoomend", renderExploreCreeks);
+
+  Promise.all([
+    loadStates(),
+    loadCreeks()
+  ]);
+
+  loadTalk();
+})();
